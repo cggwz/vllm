@@ -75,7 +75,7 @@ def _log_task_completion(task: asyncio.Task,
 
 STOP_ITERATION = Exception()  # Sentinel
 
-
+# 个人理解：基于asyncio.Queue进行封装
 class AsyncStream:
     """A stream of RequestOutputs or PoolingRequestOutputs for a request
     that can be iterated over asynchronously via an async generator."""
