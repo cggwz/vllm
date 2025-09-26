@@ -18,7 +18,14 @@ from vllm.platforms import current_platform
 from vllm.utils import weak_ref_tensors
 
 logger = init_logger(__name__)
+graph_index = 0
 
+class AppConfig:
+    COUNTER = 0  # 类属性作为全局状态
+
+    @classmethod
+    def increment(cls):
+        cls.COUNTER += 1
 
 @dataclasses.dataclass
 class CUDAGraphEntry:
@@ -67,6 +74,7 @@ class CUDAGraphWrapper:
                  runnable: Callable,
                  vllm_config: VllmConfig,
                  runtime_mode: CUDAGraphMode,
+                 rank: int,
                  graph_pool: Any = None,
                  cudagraph_options: Optional[CUDAGraphOptions] = None):
         self.runnable = runnable
@@ -74,6 +82,9 @@ class CUDAGraphWrapper:
         self.graph_pool = graph_pool
         self.runtime_mode = runtime_mode
         self.compilation_config = vllm_config.compilation_config
+        self.rank = rank
+        
+        
 
         self.first_run_finished = False
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
@@ -104,10 +115,12 @@ class CUDAGraphWrapper:
         return self.runnable
 
     def __call__(self, *args, **kwargs):
+        
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
+        # 设置的是不捕获状态，直接运行
         if cudagraph_runtime_mode == CUDAGraphMode.NONE or \
                             cudagraph_runtime_mode != self.runtime_mode:
             # CUDAGraphMode.NONE could mean the profile run, a warmup run, or
@@ -126,6 +139,10 @@ class CUDAGraphWrapper:
         entry = self.concrete_cudagraph_entries[batch_descriptor]
 
         if entry.cudagraph is None:
+            # logger.info("cgg checkpoint! need to capture a cudagraph, num token:%d",
+            #             batch_descriptor.num_tokens)
+            # logger.info("cgg checkpoint!  Capturing a cudagraph %d on (%s,%s)",AppConfig.COUNTER,
+            #                  self.runtime_mode.name, entry.batch_descriptor)
             if self.cudagraph_options.debug_log_enable:
                 # Since we capture cudagraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -141,6 +158,7 @@ class CUDAGraphWrapper:
             ]
             entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
+            cudagraph.enable_debug_mode()
 
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
@@ -171,6 +189,11 @@ class CUDAGraphWrapper:
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
+            cudagraph.debug_dump("/mnt/sda1/cgg/graph/cuda_graph_"+str(self.rank)+"_"+str(batch_descriptor.num_tokens)+"_"+str(AppConfig.COUNTER)+".dot")
+            # logger.info("Finished capturing a cudagraph %d on (%s,%s)",graph_index,
+            #                  self.runtime_mode.name, entry.batch_descriptor)
+            AppConfig.increment()
+            # 
 
             compilation_counter.num_cudagraph_captured += 1
 

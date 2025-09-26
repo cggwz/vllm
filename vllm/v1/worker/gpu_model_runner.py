@@ -2048,7 +2048,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.model = CUDAGraphWrapper(self.model,
                                           self.vllm_config,
-                                          runtime_mode=CUDAGraphMode.FULL)
+                                          runtime_mode=CUDAGraphMode.FULL,
+                                          rank=get_pp_group().get_rank()*10+get_tp_group().get_rank())
 
     def reload_weights(self) -> None:
         assert getattr(self, "model", None) is not None, \

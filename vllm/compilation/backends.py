@@ -350,7 +350,8 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 # class) as platform dependent.
                 static_graph_wrapper_class = resolve_obj_by_qualname(
                     current_platform.get_static_graph_wrapper_cls())
-
+                logger.info("cgg use static_graph_wrapper_class %s",
+                            static_graph_wrapper_class)
                 # Always assign PIECEWISE runtime mode to the
                 # CUDAGraphWrapper for piecewise_backend, to distinguish
                 # it from the FULL cudagraph runtime mode, no matter it
@@ -359,6 +360,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                     runnable=piecewise_backend,
                     vllm_config=self.vllm_config,
                     runtime_mode=CUDAGraphMode.PIECEWISE,
+                    rank=self.vllm_config.parallel_config.rank,
                     graph_pool=self.graph_pool,
                     cudagraph_options=CUDAGraphOptions(
                         debug_log_enable=piecewise_backend.is_first_graph,

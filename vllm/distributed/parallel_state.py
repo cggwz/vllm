@@ -280,6 +280,11 @@ class GroupCoordinator:
             torch.ops._C, "init_shm_manager"))
 
     @property
+    def get_rank(self):
+        """Return the global rank of the caller"""
+        return self.rank
+    
+    @property
     def first_rank(self):
         """Return the global rank of the first process in the group"""
         return self.ranks[0]
