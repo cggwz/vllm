@@ -1189,6 +1189,7 @@ def is_uva_available() -> bool:
 class DeviceMemoryProfiler:
 
     def __init__(self, device: Optional[torch.types.Device] = None):
+        print("device in init args:", device)
         self.device = device
 
     def current_memory_usage(self) -> float:
@@ -1198,6 +1199,7 @@ class DeviceMemoryProfiler:
         return current_platform.get_current_memory_usage(self.device)
 
     def __enter__(self):
+        print("device in enter:", self.device)
         self.initial_memory = self.current_memory_usage()
         # This allows us to call methods of the context manager if needed
         return self
