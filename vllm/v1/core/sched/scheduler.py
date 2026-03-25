@@ -1177,8 +1177,22 @@ class Scheduler(SchedulerInterface):
             kv_transfer_params = None
             status_before_stop = request.status
 
+            # Prefill-only mode: once all prompt tokens are processed, mark the
+            # request finished and do NOT decode any output tokens. Note that
+            # the model runner may still return sampled_token_ids on the final
+            # prefill step; we ignore those to ensure decode is skipped.
+            if (
+                request.sampling_params is not None
+                and getattr(request.sampling_params, "prefill_only", False)
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                request.status = RequestStatus.FINISHED_STOPPED
+                request.stop_reason = "prefill_only"
+                # print(f"Prefill-only mode: request {req_id} finished")
+                stopped = True
+                new_token_ids = []
             # Check for stop and update request status.
-            if new_token_ids:
+            elif new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
@@ -1242,7 +1256,7 @@ class Scheduler(SchedulerInterface):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None or kv_transfer_params:
+            if stopped or new_token_ids or pooler_output is not None or kv_transfer_params:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(

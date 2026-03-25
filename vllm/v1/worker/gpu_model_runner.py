@@ -2729,6 +2729,31 @@ class GPUModelRunner(
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        # Prefill-only mode: never sample any tokens.
+        # This avoids doing decode work in the final prefill step and ensures
+        # the request can be used to measure pure prefill latency.
+        self._prefill_only_active = False
+        try:
+            req_ids = self.input_batch.req_ids
+            if req_ids:
+                self._prefill_only_active = all(
+                    (self.requests[rid].sampling_params is not None)
+                    and getattr(self.requests[rid].sampling_params, "prefill_only", False)
+                    for rid in req_ids
+                )
+        except Exception:
+            self._prefill_only_active = False
+
+        if self._prefill_only_active:
+            num_reqs = len(self.input_batch.req_ids)
+            sampled = torch.full(
+                (num_reqs, 1),
+                -1,
+                device=self.device,
+                dtype=torch.int32,
+            )
+            return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
+
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
@@ -2822,7 +2847,11 @@ class GPUModelRunner(
             # These will be copied into input_ids in the next step
             # when preparing inputs.
             # With spec decoding, this is done in propose_draft_token_ids().
-            if self.input_batch.prev_sampled_token_ids is None:
+            if getattr(self, "_prefill_only_active", False):
+                # Prefill-only mode: do not cache sampled tokens for the next
+                # step (there should be no decode step).
+                pass
+            elif self.input_batch.prev_sampled_token_ids is None:
                 assert sampled_token_ids.shape[-1] == 1
                 self.input_batch.prev_sampled_token_ids = sampled_token_ids
             self.input_batch.prev_req_id_to_index = {

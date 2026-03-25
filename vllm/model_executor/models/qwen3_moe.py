@@ -346,8 +346,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
+        num_experts = getattr(config, "num_experts", 0)
+        decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
         if (layer_idx not in mlp_only_layers) and (
-            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+            num_experts > 0 and (layer_idx + 1) % decoder_sparse_step == 0
         ):
             self.mlp = Qwen3MoeSparseMoeBlock(
                 vllm_config=vllm_config, prefix=f"{prefix}.mlp"
@@ -469,12 +471,15 @@ class Qwen3MoeModel(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        num_experts = getattr(self.config, "num_experts", 0)
+        if num_experts == 0:
+            return []
         return FusedMoE.make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=num_experts,
             num_redundant_experts=self.num_redundant_experts,
         )
 
@@ -625,6 +630,8 @@ class Qwen3MoeModel(nn.Module):
                             continue
                         else:
                             name = remapped_kv_scale_name
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader

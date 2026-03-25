@@ -1388,7 +1388,7 @@ def _estimate_max_model_len_from_groups(
 
 def _auto_fit_max_model_len(
     vllm_config: VllmConfig,
-    kv_cache_groups: list[KVCacheGroupSpec],
+    kv_cache_groups_per_worker: list[list[KVCacheGroupSpec]],
     available_memory: list[int],
 ) -> None:
     """
@@ -1399,14 +1399,16 @@ def _auto_fit_max_model_len(
 
     Args:
         vllm_config: The global VllmConfig (will be modified in-place)
-        kv_cache_groups: The global KV cache groups (from get_kv_cache_groups).
-            This correctly accounts for padding in hybrid models.
+        kv_cache_groups_per_worker: KV cache groups for each worker. When
+            workers have different specs (e.g. uneven TP), each worker has
+            its own groups. Otherwise, all workers share the same groups.
         available_memory: Memory available for KV cache in bytes for each
             worker.
     """
     original_max = vllm_config.model_config.max_model_len
 
-    if not kv_cache_groups:
+    # Use first worker's groups to check if empty (all workers same structure)
+    if not kv_cache_groups_per_worker or not kv_cache_groups_per_worker[0]:
         # All workers have empty specs (attention-free model)
         logger.info_once(
             "Auto-fit max_model_len: attention-free model, "
@@ -1416,11 +1418,14 @@ def _auto_fit_max_model_len(
         )
         return
 
-    # Use minimum available memory across all workers
-    min_available_memory = min(available_memory)
-    auto_fit_max = _estimate_max_model_len_from_groups(
-        vllm_config, kv_cache_groups, min_available_memory
-    )
+    # For each worker, find max model len that fits. Take minimum across
+    # workers (bottleneck).
+    auto_fit_max = original_max
+    for groups_i, available_i in zip(kv_cache_groups_per_worker, available_memory):
+        max_len_i = _estimate_max_model_len_from_groups(
+            vllm_config, groups_i, available_i
+        )
+        auto_fit_max = min(auto_fit_max, max_len_i)
 
     if auto_fit_max <= 0:
         raise ValueError(
@@ -1439,12 +1444,13 @@ def _auto_fit_max_model_len(
     else:
         # Need to reduce max_model_len to fit in memory
         vllm_config.model_config.max_model_len = auto_fit_max
+        min_available = min(available_memory)
         logger.info_once(
             "Auto-fit max_model_len: reduced from %d to %d to fit in "
             "available GPU memory (%s GiB available for KV cache)",
             original_max,
             auto_fit_max,
-            format_gib(min_available_memory),
+            format_gib(min_available),
             scope="local",
         )
 
@@ -1485,47 +1491,25 @@ def get_kv_cache_configs(
 
     # Merge the KV cache specs of all workers. Different PP stages may have
     # different layer names, and different TP ranks of the same PP stage should
-    # have the same KV cache spec.
+    # have the same KV cache spec. For uneven TP, workers may have different
+    # specs for the same layer (e.g. different num_kv_heads).
     merged_kv_cache_specs: dict[str, KVCacheSpec] = {}
     for kv_cache_spec_one_worker in kv_cache_specs:
         for layer_name, layer_spec in kv_cache_spec_one_worker.items():
             if layer_name not in merged_kv_cache_specs:
                 merged_kv_cache_specs[layer_name] = layer_spec
-            else:
-                assert merged_kv_cache_specs[layer_name] == layer_spec, (
-                    "The KV cache specs for the same layer are different "
-                    "across workers. This is not supported yet."
-                )
+            # When specs differ (e.g. uneven TP), keep first worker's for
+            # grouping; each worker uses its own spec when building configs
 
     # Get global KV cache groups. This also handles spec unification for
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
 
-    # If original_max_model_len was -1, automatically
-    # determine the maximum model length that fits in available GPU memory.
-    # We use the global groups here to correctly account for padding.
-    if vllm_config.model_config.original_max_model_len == -1:
-        _auto_fit_max_model_len(vllm_config, global_kv_cache_groups, available_memory)
-
-    # Check if the available memory is enough (using min across all workers).
-    # We use the global groups to correctly account for padding.
-    if global_kv_cache_groups:
-        _check_enough_kv_cache_memory(
-            min(available_memory),
-            lambda: _max_memory_usage_bytes_from_groups(
-                vllm_config, global_kv_cache_groups
-            ),
-            vllm_config.model_config.max_model_len,
-            lambda am: _estimate_max_model_len_from_groups(
-                vllm_config, global_kv_cache_groups, am
-            ),
-        )
-
-    kv_cache_configs: list[KVCacheConfig] = []
-    for kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        kv_cache_specs, available_memory
-    ):
+    # Build per-worker KV cache groups. When workers have different specs
+    # (e.g. uneven TP), each worker uses its own spec for its layers.
+    kv_cache_groups_per_worker: list[list[KVCacheGroupSpec]] = []
+    for kv_cache_spec_one_worker in kv_cache_specs:
         kv_cache_groups_one_worker: list[KVCacheGroupSpec] = []
         for group in global_kv_cache_groups:
             group_layer_names_one_worker = [
@@ -1533,12 +1517,50 @@ def get_kv_cache_configs(
                 for layer_name in group.layer_names
                 if layer_name in kv_cache_spec_one_worker
             ]
+            if not group_layer_names_one_worker:
+                continue
+            # Use this worker's own spec for the group (important for uneven TP)
+            worker_spec = kv_cache_spec_one_worker[group_layer_names_one_worker[0]]
             kv_cache_groups_one_worker.append(
-                KVCacheGroupSpec(group_layer_names_one_worker, group.kv_cache_spec)
+                KVCacheGroupSpec(group_layer_names_one_worker, worker_spec)
             )
+        kv_cache_groups_per_worker.append(kv_cache_groups_one_worker)
+
+    # Use per-worker groups for auto_fit and memory check. When specs are
+    # uniform, all workers have same groups; when different (e.g. uneven TP),
+    # each worker uses its own spec.
+    groups_for_auto_fit = kv_cache_groups_per_worker
+
+    # If original_max_model_len was -1, automatically
+    # determine the maximum model length that fits in available GPU memory.
+    if vllm_config.model_config.original_max_model_len == -1:
+        _auto_fit_max_model_len(
+            vllm_config, groups_for_auto_fit, available_memory
+        )
+
+    # Check if the available memory is enough for each worker.
+    for i, (groups_i, available_i) in enumerate(zip(groups_for_auto_fit, available_memory)):
+        if groups_i:
+            _check_enough_kv_cache_memory(
+                available_i,
+                lambda g=groups_i: _max_memory_usage_bytes_from_groups(
+                    vllm_config, g
+                ),
+                vllm_config.model_config.max_model_len,
+                lambda am, g=groups_i: _estimate_max_model_len_from_groups(
+                    vllm_config, g, am
+                ),
+            )
+
+    kv_cache_configs: list[KVCacheConfig] = []
+    for kv_cache_spec_one_worker, available_memory_one_worker, kv_cache_groups_one_worker in zip(
+        kv_cache_specs, available_memory, kv_cache_groups_per_worker
+    ):
         assert sum(
             len(group.layer_names) for group in kv_cache_groups_one_worker
-        ) == len(kv_cache_spec_one_worker), "Some layers are not assigned to any group."
+        ) == len(kv_cache_spec_one_worker), (
+            "Some layers are not assigned to any group."
+        )
         kv_cache_configs.append(
             get_kv_cache_config_from_groups(
                 vllm_config, kv_cache_groups_one_worker, available_memory_one_worker

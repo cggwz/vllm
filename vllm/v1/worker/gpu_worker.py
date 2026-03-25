@@ -154,6 +154,28 @@ class Worker(WorkerBase):
         ):
             self.model_runner.init_fp8_kv_scales()
 
+    def get_memory_stats(self) -> dict[str, Any]:
+        """Return lightweight CUDA memory stats for this worker.
+
+        This is intended to be called via ``collective_rpc("get_memory_stats")``
+        from the driver, and should be fast and side‑effect free.
+        """
+        print("get_memory_stats")
+        if self.device_config.device_type != "cuda" or not torch.cuda.is_available():
+            return {"cuda_available": False}
+
+        device_index = torch.cuda.current_device()
+        print("get device index")
+        stats = torch.cuda.memory_stats(device_index)
+        print("prepare to return")
+        print(stats)
+        return {
+            "cuda_available": True,
+            "device_index": int(device_index),
+            "device_name": torch.cuda.get_device_name(device_index),
+            #"stats": stats,
+        }
+
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if self.vllm_config.model_config.enable_sleep_mode:
             from vllm.device_allocator.cumem import CuMemAllocator

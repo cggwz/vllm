@@ -171,6 +171,14 @@ class SamplingParams(
     tokens after the EOS token is generated."""
     max_tokens: int | None = 16
     """Maximum number of tokens to generate per output sequence."""
+    prefill_only: bool = False
+    """If True, run prefill only and stop before decoding any output tokens.
+
+    This is useful for measuring TTFT / prefill latency without spending time
+    in the decode loop. When enabled, the request is marked finished as soon
+    as all prompt tokens have been processed, and no output tokens are
+    generated.
+    """
     min_tokens: int = 0
     """Minimum number of tokens to generate per output sequence before EOS or
     `stop_token_ids` can be generated"""
@@ -264,6 +272,7 @@ class SamplingParams(
         include_stop_str_in_output: bool = False,
         ignore_eos: bool = False,
         max_tokens: int | None = 16,
+        prefill_only: bool = False,
         min_tokens: int = 0,
         logprobs: int | None = None,
         prompt_logprobs: int | None = None,
@@ -305,6 +314,7 @@ class SamplingParams(
             include_stop_str_in_output=include_stop_str_in_output,
             ignore_eos=ignore_eos,
             max_tokens=max_tokens,
+            prefill_only=prefill_only,
             min_tokens=min_tokens,
             logprobs=logprobs,
             prompt_logprobs=prompt_logprobs,

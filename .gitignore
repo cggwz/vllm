@@ -232,3 +232,7 @@ ep_kernels_workspace/
 vllm/grpc/vllm_engine_pb2.py
 vllm/grpc/vllm_engine_pb2_grpc.py
 vllm/grpc/vllm_engine_pb2.pyi
+
+# Local temporary artifacts
+.pip-tmp/
+/屏幕截图 *.png

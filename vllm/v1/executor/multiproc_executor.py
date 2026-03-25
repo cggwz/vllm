@@ -579,6 +579,29 @@ class WorkerProc:
         # Create death pipe to detect parent process exit
         death_reader, death_writer = context.Pipe(duplex=False)
 
+        # Configure CUDA MPS SM partition **before** starting the child
+        # process so that the environment variable is visible when CUDA
+        # is initialized in that process. Users can set
+        # `mps_sm_partitions` in the HF text config JSON, e.g.:
+        #   "mps_sm_partitions": [1, 2]  # for TP=2
+        try:
+            hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
+            partitions = (
+                getattr(hf_config, "mps_sm_partitions", None)
+                if hf_config is not None
+                else None
+            )
+            if partitions is not None:
+                parts_list = list(partitions)
+                if 0 <= local_rank < len(parts_list):
+                    os.environ["CUDA_MPS_SM_PARTITION"] = str(
+                        parts_list[local_rank]
+                    )
+        except Exception:
+            # Fail open: if anything goes wrong, we just skip overriding
+            # the env var for this worker.
+            pass
+
         process_kwargs = {
             "vllm_config": vllm_config,
             "local_rank": local_rank,

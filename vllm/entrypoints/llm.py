@@ -6,6 +6,9 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 import cloudpickle
+import os
+import pickle
+import torch
 import torch.nn as nn
 from pydantic import ValidationError
 from tqdm.auto import tqdm
@@ -88,6 +91,84 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _R = TypeVar("_R", default=Any)
+
+
+def _inspect_parameter_memory(model: nn.Module) -> list[dict[str, Any]]:
+    """Return per-parameter memory info for a single model replica.
+
+    This helper is executed inside each worker process via `LLM.apply_model`.
+    It only returns lightweight Python objects (no GPU tensors) so that the
+    results can be safely gathered back to the driver process.
+    """
+    results: list[dict[str, Any]] = []
+    for name, param in model.named_parameters():
+        # Some modules may register non-tensor attributes in state_dict,
+        # we only care about real tensors here.
+        if not hasattr(param, "data"):
+            continue
+
+        tensor = param.data
+        # Skip uninitialized parameters to avoid accessing invalid storage.
+        if tensor is None or not hasattr(tensor, "data_ptr"):
+            continue
+
+        numel = tensor.numel()
+        element_size = tensor.element_size()
+        results.append(
+            {
+                "name": name,
+                "shape": tuple(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "device": str(tensor.device),
+                "address": int(tensor.data_ptr()),
+                "numel": int(numel),
+                "nbytes": int(numel * element_size),
+            }
+        )
+    return results
+
+
+def _cuda_dump_memory_snapshot_to_file(
+    model: nn.Module,  # noqa: ARG001
+    output_dir: str,
+    filename_prefix: str,
+) -> str:
+    """Capture a full CUDA memory snapshot and dump it to a local file.
+
+    This runs inside a worker process. It writes a pickle file containing:
+        - snapshot: torch.cuda.memory._snapshot() result
+        - stats: torch.cuda.memory_stats() result
+        - device_index, device_name
+
+    Returns:
+        The absolute path to the written snapshot file.
+    """
+    if not torch.cuda.is_available():
+        return ""
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    device_index = torch.cuda.current_device()
+    device_name = torch.cuda.get_device_name(device_index)
+
+    snapshot = torch.cuda.memory._snapshot()
+    stats = torch.cuda.memory_stats(device_index)
+
+    pid = os.getpid()
+    filename = f"{filename_prefix}_pid{pid}_dev{device_index}.pkl"
+    path = os.path.join(output_dir, filename)
+
+    payload = {
+        "snapshot": snapshot,
+        "stats": stats,
+        "device_index": int(device_index),
+        "device_name": device_name,
+    }
+
+    with open(path, "wb") as f:
+        pickle.dump(payload, f)
+
+    return os.path.abspath(path)
 
 
 class LLM:
@@ -572,6 +653,121 @@ class LLM:
             VRAM!
         """
         return self.llm_engine.apply_model(func)
+
+    def print_parameter_memory(self) -> list[list[dict[str, Any]]]:
+        """Print the address and size of each parameter inside the vLLM model.
+
+        This method runs `_inspect_parameter_memory` on every worker replica
+        and prints a per-worker summary like:
+
+            Worker 0:
+              model.layers.0.self_attn.q_proj.weight: addr=0x..., nbytes=..., shape=..., dtype=..., device=...
+              ...
+
+        Returns:
+            A nested list where the outer list is indexed by worker rank and
+            each inner list contains dictionaries with the following keys:
+            ``name``, ``shape``, ``dtype``, ``device``, ``address``,
+            ``numel``, ``nbytes``.
+        """
+
+        results = self.llm_engine.apply_model(_inspect_parameter_memory)
+
+        for rank, params in enumerate(results):
+            print(f"=== Worker {rank} ===")
+            for info in params:
+                name = info["name"]
+                addr = info["address"]
+                nbytes = info["nbytes"]
+                shape = info["shape"]
+                dtype = info["dtype"]
+                device = info["device"]
+                print(
+                    f"{name}: addr=0x{addr:x}, nbytes={nbytes}, "
+                    f"shape={shape}, dtype={dtype}, device={device}"
+                )
+
+        return results
+
+    def get_memory_stats(self) -> list[dict[str, Any]]:
+        """Collect lightweight PyTorch CUDA memory stats from all workers.
+
+        Returns:
+            A list indexed by worker rank. Each element is a dictionary with:
+
+            - ``cuda_available``: Whether CUDA is available in that worker.
+            - ``device_index``: The CUDA device index (when available).
+            - ``device_name``: Human-readable device name.
+            - ``stats``: Output of :func:`torch.cuda.memory_stats`.
+        """
+        return self.llm_engine.collective_rpc("get_memory_stats")
+
+    # Backwards-compatible alias: old name now只返回 stats，而不再回传完整 snapshot。
+    def get_memory_snapshot(self) -> list[dict[str, Any]]:
+        """Alias for get_memory_stats() (kept for compatibility)."""
+        return self.get_memory_stats()
+
+    def print_memory_distribution(self) -> list[dict[str, Any]]:
+        """Print a per-worker summary of current CUDA memory usage.
+
+        This is a quick overview based on :func:`torch.cuda.memory_stats` to
+        inspect Allocated / Reserved / Active / Inactive memory on each worker.
+        For fine-grained segment-level analysis, use
+        :meth:`dump_memory_snapshot` and analyze dumped files offline.
+        """
+        summaries = self.get_memory_stats()
+
+        for rank, info in enumerate(summaries):
+            if not info.get("cuda_available", False):
+                print(f"=== Worker {rank} ===")
+                print("CUDA not available in this worker.")
+                continue
+
+            device_index = info["device_index"]
+            device_name = info["device_name"]
+            stats = info["stats"]
+
+            allocated = stats.get("allocated_bytes.all.current", 0)
+            reserved = stats.get("reserved_bytes.all.current", 0)
+            active = stats.get("active_bytes.all.current", 0)
+            inactive = stats.get("inactive_split_bytes.all.current", 0)
+
+            print(f"=== Worker {rank} (CUDA device {device_index}: {device_name}) ===")
+            print(f"  Allocated: {allocated / 1024**3:.2f} GiB")
+            print(f"  Reserved : {reserved / 1024**3:.2f} GiB")
+            print(f"  Active   : {active / 1024**3:.2f} GiB")
+            print(f"  Inactive : {inactive / 1024**3:.2f} GiB")
+
+        return summaries
+
+    def dump_memory_snapshot(
+        self,
+        output_dir: str,
+        filename_prefix: str = "memory_snapshot",
+    ) -> list[str]:
+        """Capture full CUDA memory snapshots on all workers and dump to files.
+
+        Args:
+            output_dir: Directory where snapshot pickle files will be written.
+            filename_prefix: Prefix for each snapshot file name.
+
+        Returns:
+            A list of absolute file paths, one per worker rank. Each file is a
+            pickle containing a dict with keys:
+                ``snapshot``, ``stats``, ``device_index``, ``device_name``.
+
+        Note:
+            这是一个“重”操作：会在每个 worker 上调用
+            :func:`torch.cuda.memory._snapshot` 并写磁盘，耗时显著高于
+            :meth:`get_memory_stats` / :meth:`print_memory_distribution`。
+        """
+
+        def _dump(model: nn.Module) -> str:
+            return _cuda_dump_memory_snapshot_to_file(
+                model, output_dir=output_dir, filename_prefix=filename_prefix
+            )
+
+        return self.llm_engine.apply_model(_dump)
 
     def _get_beam_search_lora_requests(
         self,

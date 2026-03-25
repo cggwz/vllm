@@ -22,6 +22,14 @@ class AsyncScheduler(Scheduler):
                 request.use_structured_output and request.num_output_placeholders > 0
             )
             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
+            # Prefill-only mode: never schedule the extra "decode" token that
+            # async scheduling would normally add when prompt tokens are done.
+            if (
+                request.sampling_params is not None
+                and getattr(request.sampling_params, "prefill_only", False)
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                continue
             if (
                 request.num_computed_tokens
                 == request.num_tokens
